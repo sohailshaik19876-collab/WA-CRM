@@ -1,0 +1,159 @@
+name: RLS
+
+# Real end-to-end RLS coverage — hardening plan (post-Fase 2 audit).
+# Complements `migrations.yml` (which only proves the schema exists
+# after a clean replay) with a suite that proves the multi-tenant
+# isolation actually holds: two real Auth users, two real accounts,
+# and every assertion made through a signed-in `anon`-key session —
+# never `service_role`. See tests/rls/README.md for the full design
+# and its explicit limits.
+#
+# Separate job, separate workflow, on purpose: this suite is slower
+# (it boots the FULL local Supabase stack — Auth/PostgREST included,
+# not just Postgres, since real JWTs are required) and MUST NEVER be a
+# required check that blocks a PR that doesn't touch anything RLS
+# depends on. It shares no state with `ci.yml`'s fast, mock-only
+# `npm test`.
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/**'
+      - 'tests/rls/**'
+      - 'vitest.rls.config.ts'
+      - '.github/workflows/rls.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/**'
+      - 'tests/rls/**'
+      - 'vitest.rls.config.ts'
+      - '.github/workflows/rls.yml'
+  # Manual trigger for a one-off run without touching any of the paths
+  # above (e.g. after a dependency bump).
+  workflow_dispatch:
+
+concurrency:
+  group: rls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rls:
+    name: Real RLS isolation (local Postgres + Auth)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same pin as migrations.yml — a CLI release changing local-stack
+      # behaviour should be a deliberate bump in a PR, never a silent
+      # drift between the two workflows.
+      - name: Install the Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.113.0
+
+      # Full stack, not `supabase db start` — this suite needs real
+      # Auth (GoTrue) + PostgREST for genuine per-user JWTs, which
+      # migrations.yml's Postgres-only check does not.
+      - name: Start Supabase (local stack)
+        run: supabase start
+
+      # `start` already applies migrations to a cold volume, but this
+      # guarantees every migration ran, from nothing, in filename
+      # order, on every run — same reasoning as migrations.yml.
+      - name: Replay every migration from scratch
+        run: supabase db reset --local --no-seed
+
+      # `supabase status -o env` (confirmed by the first real run of this
+      # workflow) prints each value double-quoted — e.g.
+      # `API_URL="http://127.0.0.1:54321"` — not the bare `KEY=value`
+      # this step originally assumed. Piping that line straight into
+      # `$GITHUB_ENV` set the env var to the literal, quote-wrapped
+      # string, which env-guard.ts correctly rejected as "not a valid
+      # URL" (it is not — it is a URL wrapped in `"` characters).
+      #
+      # Fixed with a plain shell loop (no `eval`, nothing executed from
+      # the tool's own output) that strips one leading and one trailing
+      # `"` per value via parameter expansion — a no-op if a future CLI
+      # version ever prints the value bare instead.
+      - name: Export local Supabase connection details
+        id: local-env
+        run: |
+          while IFS='=' read -r key value; do
+            case "$key" in
+              API_URL|ANON_KEY|SERVICE_ROLE_KEY)
+                value="${value%\"}"
+                value="${value#\"}"
+                echo "${key}=${value}" >> "$GITHUB_ENV"
+                ;;
+            esac
+          done < <(supabase status -o env)
+
+      # Diagnostic — API_URL only. Never ANON_KEY or SERVICE_ROLE_KEY:
+      # even though both are local-only, throwaway credentials with no
+      # access beyond this ephemeral runner's own database, they have
+      # no reason to appear in a public job log, and this step doesn't
+      # need them to be useful — it exists solely to make a future
+      # "does this even look like a URL" failure a one-line log read.
+      - name: Show the resolved local API URL (diagnostic — no keys)
+        run: echo "Resolved API_URL=$API_URL"
+        env:
+          API_URL: ${{ env.API_URL }}
+
+      # TEMPORARY DIAGNOSTIC — decodes ONLY the `role`/`iss`/`ref` claims
+      # of the service_role JWT payload (never the raw key, header, or
+      # signature) to determine whether it actually carries
+      # `role: service_role`. To be removed once the root cause of
+      # "permission denied for table accounts/profiles" is confirmed.
+      - name: 'DIAGNOSTIC: decode service_role JWT claims (no secrets printed)'
+        env:
+          SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
+        run: |
+          payload=$(echo "$SERVICE_ROLE_KEY" | cut -d '.' -f2 | tr '_-' '/+')
+          case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+          esac
+          claims=$(echo "$payload" | base64 -d 2>/dev/null)
+          echo "SERVICE_ROLE_JWT_ROLE=$(echo "$claims" | jq -r '.role // "MISSING"')"
+          echo "SERVICE_ROLE_JWT_ISSUER=$(echo "$claims" | jq -r '.iss // "MISSING"')"
+          echo "SERVICE_ROLE_JWT_REF=$(echo "$claims" | jq -r '.ref // "MISSING"')"
+
+      # TEMPORARY DIAGNOSTIC — reads real SQL-level privileges and RLS
+      # status directly from the local Postgres catalog, via the CLI's
+      # own admin connection (never through PostgREST/service_role) —
+      # a single read-only SELECT, nothing granted/revoked/altered. To
+      # be removed once the root cause is confirmed.
+      - name: 'DIAGNOSTIC: real SQL privileges + RLS status for accounts/profiles'
+        run: |
+          supabase db query --local "select
+            has_table_privilege('service_role','public.accounts','SELECT') as accounts_select,
+            has_table_privilege('service_role','public.accounts','INSERT') as accounts_insert,
+            has_table_privilege('service_role','public.accounts','UPDATE') as accounts_update,
+            has_table_privilege('service_role','public.accounts','DELETE') as accounts_delete,
+            has_table_privilege('service_role','public.profiles','SELECT') as profiles_select,
+            has_table_privilege('service_role','public.profiles','INSERT') as profiles_insert,
+            has_table_privilege('service_role','public.profiles','UPDATE') as profiles_update,
+            has_table_privilege('service_role','public.profiles','DELETE') as profiles_delete,
+            (select rolbypassrls from pg_roles where rolname = 'service_role') as service_role_bypassrls,
+            (select relrowsecurity from pg_class where oid = 'public.accounts'::regclass) as accounts_rls,
+            (select relrowsecurity from pg_class where oid = 'public.profiles'::regclass) as profiles_rls;"
+
+      - name: Run the real-RLS suite
+        env:
+          RLS_TEST_SUPABASE_URL: ${{ env.API_URL }}
+          RLS_TEST_SUPABASE_ANON_KEY: ${{ env.ANON_KEY }}
+          RLS_TEST_SUPABASE_SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
+        run: npm run test:rls
+
+      - name: Stop Supabase
+        if: always()
+        run: supabase stop
