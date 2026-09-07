@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { NextIntlClientProvider } from 'next-intl';
 import { getLocale, getMessages } from 'next-intl/server';
-import { Inter } from "next/font/google";
+import { Inter, Plus_Jakarta_Sans } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
 import { ThemeProvider } from "@/hooks/use-theme";
@@ -17,6 +17,16 @@ import {
 
 const inter = Inter({
   variable: "--font-sans",
+  subsets: ["latin"],
+});
+
+// Display face for headings, nav labels and big numbers. Body text
+// stays on Inter (see --font-sans); this variable is mapped to the
+// `--font-heading` Tailwind token in globals.css, so anything using
+// the `font-heading` utility (e.g. CardTitle) and every h1–h6 picks
+// it up. Variable font — no explicit weight list needed.
+const jakarta = Plus_Jakarta_Sans({
+  variable: "--font-display",
   subsets: ["latin"],
 });
 
@@ -90,7 +100,7 @@ export default async function RootLayout({
       lang={locale}
       data-theme={DEFAULT_THEME}
       data-mode={DEFAULT_MODE}
-      className={`${inter.variable} h-full antialiased`}
+      className={`${inter.variable} ${jakarta.variable} h-full antialiased`}
       // The `theme-boot` script below rewrites `data-theme` and
       // `data-mode` on <html> from localStorage before React hydrates,
       // so for any non-default choice the client DOM intentionally
