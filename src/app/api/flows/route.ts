@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { requireRole, toErrorResponse } from '@/lib/auth/account'
+import {
+  requireRole,
+  toErrorResponse,
+  UnauthorizedError,
+  ForbiddenError,
+} from '@/lib/auth/account'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 import { getFlowTemplate } from '@/lib/flows/templates'
 
@@ -46,14 +51,30 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  try {
+    return await createFlow(request)
+  } catch (err) {
+    // Role/auth errors map to their typed status. Anything else —
+    // most commonly supabaseAdmin() throwing because
+    // SUPABASE_SERVICE_ROLE_KEY isn't set in the environment — becomes
+    // a clean JSON 500 with an actionable message, instead of the
+    // opaque HTML 500 that surfaced to users as "Clone failed: 500".
+    if (err instanceof UnauthorizedError || err instanceof ForbiddenError) {
+      return toErrorResponse(err)
+    }
+    console.error('[POST /api/flows] unexpected error:', err)
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Failed to create flow' },
+      { status: 500 },
+    )
+  }
+}
+
+async function createFlow(request: Request) {
   // Creating a flow is a write — the RLS flows_insert policy requires
   // `agent`, but this route inserts via the service-role client which
   // bypasses RLS, so the role must be enforced here.
-  try {
-    await requireRole('agent')
-  } catch (err) {
-    return toErrorResponse(err)
-  }
+  await requireRole('agent')
 
   const guard = await requireUser()
   if (!guard.ok) {
